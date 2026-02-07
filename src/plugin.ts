@@ -9,14 +9,20 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
-import type { ConversionSource } from '@chips/cardto-html-plugin';
-import { CardtoHTMLPlugin } from '@chips/cardto-html-plugin';
+import type {
+  ConversionSource,
+  ConversionAppearanceProfile,
+} from '@chips/cardto-html-plugin';
+import {
+  CardtoHTMLPlugin,
+  ErrorCode,
+  resolveConversionAppearance,
+} from '@chips/cardto-html-plugin';
 import type {
   ImageFormat,
   ImageConversionOptions,
   ImageConversionResult,
   ImageConverterPlugin,
-  ImageProgressInfo,
   ImageConversionStatus,
   ImageValidationResult,
 } from './types';
@@ -43,8 +49,9 @@ const PLUGIN_METADATA = {
  * 默认转换选项
  * @internal
  */
-const DEFAULT_OPTIONS: Required<
-  Omit<ImageConversionOptions, 'outputPath' | 'themeId' | 'onProgress' | 'width' | 'height'>
+const DEFAULT_OPTIONS: Pick<
+  ImageConversionOptions,
+  'format' | 'quality' | 'scale' | 'backgroundColor' | 'transparent' | 'waitTime'
 > = {
   format: 'png',
   quality: 90,
@@ -96,7 +103,7 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
   readonly version = PLUGIN_METADATA.version;
 
   /** 支持的源类型 */
-  readonly sourceTypes = PLUGIN_METADATA.sourceTypes;
+  readonly sourceTypes = [...PLUGIN_METADATA.sourceTypes];
 
   /** 目标类型 */
   readonly targetType = PLUGIN_METADATA.targetType;
@@ -189,10 +196,16 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
 
       // 阶段 1: HTML 转换
       reportProgress('converting-html', 0, '正在解析卡片并生成 HTML');
+      const appearance = resolveConversionAppearance({
+        profileId: mergedOptions.appearanceProfileId,
+        overrides: mergedOptions.appearanceOverrides,
+      });
 
       const htmlResult = await this._htmlPlugin.convert(source, {
         themeId: mergedOptions.themeId,
         includeAssets: true,
+        appearanceProfileId: appearance.id,
+        appearanceOverrides: mergedOptions.appearanceOverrides,
       });
 
       if (!htmlResult.success || !htmlResult.data) {
@@ -201,7 +214,7 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
           success: false,
           taskId,
           error: htmlResult.error ?? {
-            code: 'CONV-HTML-002' as const,
+            code: ErrorCode.RENDER_FAILED,
             message: 'HTML 转换失败，未能获取有效数据',
           },
           duration: Date.now() - startTime,
@@ -215,7 +228,9 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
 
       const { imageData, width, height } = await this._renderHTMLToImage(
         htmlResult.data.files,
-        mergedOptions
+        mergedOptions,
+        options,
+        appearance
       );
 
       reportProgress('capturing', 80, '正在生成图片');
@@ -259,7 +274,15 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
    * @returns 默认的转换选项副本
    */
   getDefaultOptions(): ImageConversionOptions {
-    return { ...DEFAULT_OPTIONS };
+    const appearance = resolveConversionAppearance();
+    return {
+      ...DEFAULT_OPTIONS,
+      width: appearance.image.viewportWidthPx,
+      height: appearance.image.viewportHeightPx,
+      scale: appearance.image.deviceScaleFactor,
+      waitTime: appearance.image.waitTimeMs,
+      backgroundColor: appearance.layout.pageBackgroundColor,
+    };
   }
 
   /**
@@ -367,7 +390,9 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
    */
   private async _renderHTMLToImage(
     files: Map<string, string | Uint8Array>,
-    options: ImageConversionOptions
+    mergedOptions: ImageConversionOptions,
+    rawOptions: ImageConversionOptions | undefined,
+    appearance: ConversionAppearanceProfile
   ): Promise<{ imageData: Uint8Array; width: number; height: number }> {
     // 动态导入 Puppeteer
     let puppeteer: typeof import('puppeteer') | undefined;
@@ -399,11 +424,12 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
     try {
       const page = await browser.newPage();
 
-      // 设置视口
-      const viewportWidth = options.width ?? 800;
-      const viewportHeight = options.height ?? 600;
-      const deviceScaleFactor = options.scale ?? 1;
+      const viewportWidth = rawOptions?.width ?? appearance.image.viewportWidthPx;
+      const viewportHeight = rawOptions?.height ?? appearance.image.viewportHeightPx;
+      const deviceScaleFactor = rawOptions?.scale ?? appearance.image.deviceScaleFactor;
+      const waitTime = rawOptions?.waitTime ?? appearance.image.waitTimeMs;
 
+      // 设置视口
       await page.setViewport({
         width: viewportWidth,
         height: viewportHeight,
@@ -418,7 +444,6 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
       });
 
       // 额外等待时间
-      const waitTime = options.waitTime ?? 1000;
       if (waitTime > 0) {
         await new Promise((resolve) => setTimeout(resolve, waitTime));
       }
@@ -446,23 +471,13 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
       });
 
       // 配置截图选项
-      const screenshotOptions: Parameters<typeof page.screenshot>[0] = {
-        type:
-          options.format === 'jpg' || options.format === 'jpeg'
-            ? 'jpeg'
-            : 'png',
+      const isJPEG = mergedOptions.format === 'jpg' || mergedOptions.format === 'jpeg';
+      const screenshotOptions = {
+        type: isJPEG ? 'jpeg' : 'png',
         fullPage: true,
-      };
-
-      // JPG 质量设置
-      if (options.format === 'jpg' || options.format === 'jpeg') {
-        screenshotOptions.quality = options.quality ?? 90;
-      }
-
-      // PNG 透明背景
-      if (options.format === 'png') {
-        screenshotOptions.omitBackground = options.transparent ?? false;
-      }
+        ...(isJPEG ? { quality: mergedOptions.quality ?? 90 } : {}),
+        ...(!isJPEG ? { omitBackground: mergedOptions.transparent ?? false } : {}),
+      } as Parameters<typeof page.screenshot>[0];
 
       // 执行截图
       const screenshot = await page.screenshot(screenshotOptions);
@@ -530,8 +545,9 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
         const base64 = this._uint8ArrayToBase64(content);
         const mimeType = this._getMimeType(filePath);
         const dataUrl = `data:${mimeType};base64,${base64}`;
-
         const filename = filePath.split('/').pop() ?? '';
+
+        // 替换 HTML 属性中的资源引用
         result = result.replace(
           new RegExp(
             `(src|href)=["']([^"']*${this._escapeRegex(filename)})["']`,
@@ -539,6 +555,18 @@ export class CardtoImagePlugin implements ImageConverterPlugin {
           ),
           `$1="${dataUrl}"`
         );
+
+        // 替换脚本/JSON 中的路径引用（适配直出 DOM + CHIPS_CARD_CONFIG）
+        const normalizedPaths = [filePath, `./${filePath}`, filename];
+        for (const p of normalizedPaths) {
+          result = result.replace(
+            new RegExp(
+              `"(?:${this._escapeRegex(p)})"`,
+              'g'
+            ),
+            `"${dataUrl}"`
+          );
+        }
       }
     }
 
